@@ -107,6 +107,11 @@
 
 import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
+//minollo
+import groovy.transform.Field
+
+//minollo
+@Field static java.util.concurrent.Semaphore socketMutex = new java.util.concurrent.Semaphore(1)
 
 metadata {
     definition (name: "HomeAssistant Hub Parent", namespace: "ymerj", author: "Yves Mercier", importUrl: "https://raw.githubusercontent.com/ymerj/HE-HA-control/main/HA%20parent.groovy") {
@@ -152,6 +157,8 @@ def updated(){
 
 def initialize() {
     log.info("initializing...")
+    runEvery5Minutes(checkUnavailableReports)
+	state.unavailableSince = [:]
     closeConnection()
 
     state.id = 2
@@ -292,7 +299,15 @@ def parse(String description) {
             case "valve":
             case "switch":
             case "input_boolean":
-                mapping = translateDevices(domain, newVals, friendly, origin)
+                if (newVals[0] == "unavailable") { //minollo
+                    if (logEnable) log.debug "skipping unavailable value for entity ${entity}"
+                    if (state.unavailableSince[entity] == null) {
+                        state.unavailableSince[entity] = now()
+                    }
+                } else {
+                    state.unavailableSince[entity] = null
+                	mapping = translateDevices(domain, newVals, friendly, origin)
+                }            
                 break
             
             case "light":
@@ -344,7 +359,15 @@ def parse(String description) {
                 def step = newState?.attributes?.step
                 def unit = newState?.attributes?.unit_of_measurement
                 newVals += [unit, minimum, maximum, step]
-                mapping = translateDevices(domain, newVals, friendly, origin)
+                if (newVals[0] == "unavailable") { //minollo
+                    if (logEnable) log.debug "skipping unavailable value for entity ${entity}"
+                    if (state.unavailableSince[entity] == null) {
+//                        state.unavailableSince[entity] = now()
+                    }
+                } else {
+                    state.unavailableSince[entity] = null
+	                mapping = translateDevices(domain, newVals, friendly, origin)
+                }
                 break
             
             case "sensor":
@@ -360,7 +383,22 @@ def parse(String description) {
                     newVals = [newVals[0]] + distance
                 }
                 newVals += attributes
-                mapping = translateSensors(device_class, newVals, friendly, origin)
+                if (state.unavailableSince == null) {
+                    state.unavailableSince = [:]
+                }
+                if (newVals[0] == "unavailable") { //minollo
+                    if (logEnable) log.debug "skipping unavailable value for entity ${entity}, ${device_class}"
+                    if (state.unavailableSince[entity] == null) {
+                        state.unavailableSince[entity] = now()
+                    }
+                } else {
+                    state.unavailableSince[entity] = null
+                    // minollo
+                    if (device_class == "power" && entity?.contains("zigdc")) {	// zigdc may return negative power values depending on polarity; just normalize them, as we care only about the absolute value
+                        newVals[0] = safeAbs(newVals[0])
+                    }
+                	mapping = translateSensors(device_class, newVals, friendly, origin)
+                }
                 break
             
             case "climate":
@@ -385,7 +423,15 @@ def parse(String description) {
                 if (!fan_modes) fan_modes = ["on"]
                 def supportedFmodes = JsonOutput.toJson(fan_modes)
                 newVals = [thermostat_mode, current_temperature, hvac_action, fan_mode, target_temperature, target_temp_high, target_temp_low, supportedTmodes, supportedFmodes, supportedPmodes, currentPreset, maxHumidity, minHumidity, currentHumidity, targetHumidity]
-                mapping = translateDevices(domain, newVals, friendly, origin)
+				if (thermostat_mode == "unavailable" || current_temperature == "unavailable") { //minollo
+                    if (logEnable) log.debug "skipping unavailable value for entity ${entity}"
+                    if (state.unavailableSince[entity] == null) {
+                        state.unavailableSince[entity] = now()
+                    }
+                } else {
+                    state.unavailableSince[entity] = null
+                	mapping = translateDevices(domain, newVals, friendly, origin)
+                }
                 break
             
             case "scene":
@@ -476,6 +522,20 @@ def parse(String description) {
     }
 }
 
+def checkUnavailableReports() {
+    state.unavailableSince.each { entity, since ->
+        if (since != null && now() - since > 5*60*1000) {	// unavailable for more than 5 minutes
+            def ch = getChildDevice("${device.id}-${entity}")
+            if (ch != null) {
+                if (ch.currentValue("healthStatus") == "online") {
+            		log.error "entity [${entity}] has been reporting 'unavailable' for more than 5 minutes"
+	                ch.parse([[name: "healthStatus", value: "offline", descriptionText:"${entity} has been reporting as unavailable"]])
+                }
+            }
+        }
+	}
+}
+
 def translateBinarySensors(device_class, newVals, friendly, origin)
 {
     def mapping =
@@ -525,6 +585,16 @@ def translateSensors(device_class, newVals, friendly, origin)
         ]
     if (!mapping[device_class]) device_class = "unknown"
     return mapping[device_class]
+}
+
+private BigDecimal safeAbs(value) {
+    if (value == null) return null
+
+    try {
+        return new BigDecimal(value.toString()).abs()
+    } catch (Exception e) {
+        return null
+    }
 }
 
 def translateCovers(device_class, newVals, friendly, origin)
@@ -589,8 +659,15 @@ def updateChildDevice(mapping, entity, friendly, offline) {
         return
     }
     else {
-        if (offline) mapping.event = [[name: "healthStatus", value: "offline", descriptionText:"${friendly} is offline"]]
-        else mapping.event += [name: "healthStatus", value: "online", descriptionText:"${friendly} is online"]
+        if (offline) {
+            if (state.consecutiveOfflines > 2) {
+            	mapping.event = [[name: "healthStatus", value: "offline", descriptionText:"${friendly} is offline"]]
+            }
+            state.consecutiveOfflines = state.consecutiveOfflines + 1
+        } else {
+            mapping.event += [name: "healthStatus", value: "online", descriptionText:"${friendly} is online"]
+            state.consecutiveOfflines = 0
+        }
         ch.parse(mapping.event)
     }
 }
@@ -816,14 +893,40 @@ def componentPlaySound(ch, tone, duration, volume) {
     executeCommand(ch, "turn_on", data)
 }
 
-def componentRefresh(ch) {
+// minollo
+def componentRefresh(ch, attempt = 0) {
     if (logEnable) log.info("received refresh request from ${ch.label}")
-    // special handling since domain is fixed 
-    entity = ch.name
-    messUpd = JsonOutput.toJson([id: state.id, type: "call_service", domain: "homeassistant", service: "update_entity", service_data: [entity_id: entity]])
-    state.id = state.id + 1
-    if (logEnable) log.debug("messUpd = ${messUpd}")
-    interfaces.webSocket.sendMessage("${messUpd}")
+    if (!socketMutex.tryAcquire()) {
+        if (attempt >= 10) {
+            log.error("componentRefresh busy too long; dropping request for ${ch?.deviceNetworkId}")
+            return
+        }
+        runInMillis(250, "retryComponentRefresh", [
+            data: [dni: ch?.deviceNetworkId, attempt: attempt + 1]
+        ])
+        log.warn("componentRefresh busy; retrying in 250ms request for ${ch?.deviceNetworkId}")
+        return
+    }
+    try {
+        // special handling since domain is fixed 
+        entity = ch.name
+        messUpd = JsonOutput.toJson([id: state.id, type: "call_service", domain: "homeassistant", service: "update_entity", service_data: [entity_id: entity]])
+        state.id = state.id + 1
+        if (logEnable) log.debug("messUpd = ${messUpd}")
+        interfaces.webSocket.sendMessage("${messUpd}")
+    } finally {
+        socketMutex.release()
+    }
+}
+
+// minollo
+def retryComponentRefresh(data) {
+    def ch = getChildDevice(data.dni)
+    if (ch == null) {
+        log.error("retryComponentRefresh: child ${data.dni} not found")
+        return
+    }
+    componentRefresh(ch, data.attempt ?: 0)
 }
 
 def componentSetThermostatMode(ch, thermostatmode) {
@@ -1068,25 +1171,76 @@ def closeConnection() {
     interfaces.webSocket.close()
 }
 
-def callService(entity, service, data = "") {
-    def cvData = [:]
-    cvData = data.tokenize(",").collectEntries{it.tokenize(":").with{[(it[0]):it[1..(it.size()-1)].join(":")]}}
-    domain = entity?.tokenize(".")[0]
-    messUpd = [id: state.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + cvData]
-    state.id = state.id + 1
-    messUpdStr = JsonOutput.toJson(messUpd)
-    if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
-    interfaces.webSocket.sendMessage(messUpdStr)    
+// minollo
+def callService(entity, service, data = "", attempt = 0) {
+    if (!socketMutex.tryAcquire()) {
+        if (attempt >= 10) {
+            log.error("callService busy too long; dropping ${service} for ${entity}")
+            return
+        }
+        runInMillis(250, "retryCallService", [
+            data: [entity: entity, service: service, data: data, attempt: attempt + 1]
+        ])
+        log.warn("callService busy; retrying in 250ms ${service} for ${entity}")
+        return
+    }
+
+    try {
+        def cvData = [:]
+        cvData = data.tokenize(",").collectEntries{it.tokenize(":").with{[(it[0]):it[1..(it.size()-1)].join(":")]}}
+        domain = entity?.tokenize(".")[0]
+        messUpd = [id: state.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + cvData]
+        state.id = state.id + 1
+        messUpdStr = JsonOutput.toJson(messUpd)
+        if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
+        interfaces.webSocket.sendMessage(messUpdStr)    
+    } finally {
+        socketMutex.release()
+    }
 }
 
-def executeCommand(ch, service, data = [:]) {    
-    entity = ch?.getDeviceNetworkId().split("-")[1]
-    domain = entity?.tokenize(".")[0]
-    messUpd = [id: state.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + data]
-    state.id = state.id + 1
-    messUpdStr = JsonOutput.toJson(messUpd)
-    if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
-    interfaces.webSocket.sendMessage(messUpdStr)    
+// minollo
+def retryCallService(data) {
+    callService(data.entity, data.service, data.data, data.attempt ?: 0)
+}
+
+//minollo
+def executeCommand(ch, service, data = [:], attempt = 0) {    
+    if (!socketMutex.tryAcquire()) {
+        if (attempt >= 10) {
+            log.error("executeCommand busy too long; dropping ${service} for ${ch?.deviceNetworkId}")
+            return
+        }
+        runInMillis(250, "retryExecuteCommand", [
+            data: [dni: ch?.deviceNetworkId, service: service, data: data, attempt: attempt + 1]
+        ])
+        log.warn("executeCommand busy; retrying in 250ms ${service} for ${ch?.deviceNetworkId}")
+        return
+    }
+    
+    try {
+        entity = ch?.getDeviceNetworkId().split("-")[1]
+        domain = entity?.tokenize(".")[0]
+        messUpd = [id: state.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + data]
+        state.id = state.id + 1
+        messUpdStr = JsonOutput.toJson(messUpd)
+        if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
+        log.info("executeCommand: ${entity}, ${messUpdStr}")
+        interfaces.webSocket.sendMessage(messUpdStr)    
+    }
+    finally {
+        socketMutex.release()
+    }
+}
+
+// minollo
+def retryExecuteCommand(data) {
+    def ch = getChildDevice(data.dni)
+    if (ch == null) {
+        log.error("retryExecuteCommand: child ${data.dni} not found")
+        return
+    }
+    executeCommand(ch, data.service, data.data, data.attempt ?: 0)
 }
 
 def deleteAllChildDevices() {
