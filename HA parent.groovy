@@ -107,14 +107,9 @@
 
 import groovy.json.JsonSlurper
 import groovy.json.JsonOutput
-//minollo
-import groovy.transform.Field
-
-//minollo
-@Field static java.util.concurrent.Semaphore socketMutex = new java.util.concurrent.Semaphore(1)
 
 metadata {
-    definition (name: "HomeAssistant Hub Parent", namespace: "ymerj", author: "Yves Mercier", importUrl: "https://raw.githubusercontent.com/ymerj/HE-HA-control/main/HA%20parent.groovy") {
+    definition (name: "HomeAssistant Hub Parent", namespace: "ymerj", author: "Yves Mercier", importUrl: "https://raw.githubusercontent.com/ymerj/HE-HA-control/main/HA%20parent.groovy", singleThreaded: true) {
         capability "Initialize"
         capability "Actuator"
 
@@ -349,7 +344,15 @@ def parse(String description) {
                 break
 
             case "binary_sensor":
-                mapping = translateBinarySensors(device_class, newVals, friendly, origin)
+                if (newVals[0] == "unavailable") { //minollo
+                    if (logEnable) log.debug "skipping unavailable value for entity ${entity}"
+                    if (atomicState.unavailableSince[entity] == null) {
+                        atomicState.unavailableSince[entity] = now()
+                    }
+                } else {
+                    atomicState.unavailableSince[entity] = null
+                    mapping = translateBinarySensors(device_class, newVals, friendly, origin)
+                }
                 break
 
             case "input_number":
@@ -362,7 +365,7 @@ def parse(String description) {
                 if (newVals[0] == "unavailable") { //minollo
                     if (logEnable) log.debug "skipping unavailable value for entity ${entity}"
                     if (atomicState.unavailableSince[entity] == null) {
-//                        atomicState.unavailableSince[entity] = now()
+                        atomicState.unavailableSince[entity] = now()
                     }
                 } else {
                     atomicState.unavailableSince[entity] = null
@@ -383,9 +386,6 @@ def parse(String description) {
                     newVals = [newVals[0]] + distance
                 }
                 newVals += attributes
-                if (atomicState.unavailableSince == null) {
-                    atomicState.unavailableSince = [:]
-                }
                 if (newVals[0] == "unavailable") { //minollo
                     if (logEnable) log.debug "skipping unavailable value for entity ${entity}, ${device_class}"
                     if (atomicState.unavailableSince[entity] == null) {
@@ -893,40 +893,14 @@ def componentPlaySound(ch, tone, duration, volume) {
     executeCommand(ch, "turn_on", data)
 }
 
-// minollo
-def componentRefresh(ch, attempt = 0) {
+def componentRefresh(ch) {
     if (logEnable) log.info("received refresh request from ${ch.label}")
-    if (!socketMutex.tryAcquire()) {
-        if (attempt >= 10) {
-            log.error("componentRefresh busy too long; dropping request for ${ch?.deviceNetworkId}")
-            return
-        }
-        runInMillis(250, "retryComponentRefresh", [
-                data: [dni: ch?.deviceNetworkId, attempt: attempt + 1]
-        ])
-        log.warn("componentRefresh busy; retrying in 250ms request for ${ch?.deviceNetworkId}")
-        return
-    }
-    try {
-        // special handling since domain is fixed
-        entity = ch.name
-        messUpd = JsonOutput.toJson([id: atomicState.id, type: "call_service", domain: "homeassistant", service: "update_entity", service_data: [entity_id: entity]])
-        atomicState.id = atomicState.id + 1
-        if (logEnable) log.debug("messUpd = ${messUpd}")
-        interfaces.webSocket.sendMessage("${messUpd}")
-    } finally {
-        socketMutex.release()
-    }
-}
-
-// minollo
-def retryComponentRefresh(data) {
-    def ch = getChildDevice(data.dni)
-    if (ch == null) {
-        log.error("retryComponentRefresh: child ${data.dni} not found")
-        return
-    }
-    componentRefresh(ch, data.attempt ?: 0)
+    // special handling since domain is fixed
+    entity = ch.name
+    messUpd = JsonOutput.toJson([id: atomicState.id, type: "call_service", domain: "homeassistant", service: "update_entity", service_data: [entity_id: entity]])
+    atomicState.id = atomicState.id + 1
+    if (logEnable) log.debug("messUpd = ${messUpd}")
+    interfaces.webSocket.sendMessage("${messUpd}")
 }
 
 def componentSetThermostatMode(ch, thermostatmode) {
@@ -1171,76 +1145,26 @@ def closeConnection() {
     interfaces.webSocket.close()
 }
 
-// minollo
-def callService(entity, service, data = "", attempt = 0) {
-    if (!socketMutex.tryAcquire()) {
-        if (attempt >= 10) {
-            log.error("callService busy too long; dropping ${service} for ${entity}")
-            return
-        }
-        runInMillis(250, "retryCallService", [
-                data: [entity: entity, service: service, data: data, attempt: attempt + 1]
-        ])
-        log.warn("callService busy; retrying in 250ms ${service} for ${entity}")
-        return
-    }
-
-    try {
-        def cvData = [:]
-        cvData = data.tokenize(",").collectEntries{it.tokenize(":").with{[(it[0]):it[1..(it.size()-1)].join(":")]}}
-        domain = entity?.tokenize(".")[0]
-        messUpd = [id: atomicState.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + cvData]
-        atomicState.id = atomicState.id + 1
-        messUpdStr = JsonOutput.toJson(messUpd)
-        if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
-        interfaces.webSocket.sendMessage(messUpdStr)
-    } finally {
-        socketMutex.release()
-    }
+def callService(entity, service, data = "") {
+    def cvData = [:]
+    cvData = data.tokenize(",").collectEntries{it.tokenize(":").with{[(it[0]):it[1..(it.size()-1)].join(":")]}}
+    domain = entity?.tokenize(".")[0]
+    messUpd = [id: atomicState.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + cvData]
+    atomicState.id = atomicState.id + 1
+    messUpdStr = JsonOutput.toJson(messUpd)
+    if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
+    interfaces.webSocket.sendMessage(messUpdStr)
 }
 
-// minollo
-def retryCallService(data) {
-    callService(data.entity, data.service, data.data, data.attempt ?: 0)
-}
-
-//minollo
-def executeCommand(ch, service, data = [:], attempt = 0) {
-    if (!socketMutex.tryAcquire()) {
-        if (attempt >= 10) {
-            log.error("executeCommand busy too long; dropping ${service} for ${ch?.deviceNetworkId}")
-            return
-        }
-        runInMillis(250, "retryExecuteCommand", [
-                data: [dni: ch?.deviceNetworkId, service: service, data: data, attempt: attempt + 1]
-        ])
-        log.warn("executeCommand busy; retrying in 250ms ${service} for ${ch?.deviceNetworkId}")
-        return
-    }
-
-    try {
-        entity = ch?.getDeviceNetworkId().split("-")[1]
-        domain = entity?.tokenize(".")[0]
-        messUpd = [id: atomicState.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + data]
-        atomicState.id = atomicState.id + 1
-        messUpdStr = JsonOutput.toJson(messUpd)
-        if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
-        log.info("executeCommand: ${entity}, ${messUpdStr}")
-        interfaces.webSocket.sendMessage(messUpdStr)
-    }
-    finally {
-        socketMutex.release()
-    }
-}
-
-// minollo
-def retryExecuteCommand(data) {
-    def ch = getChildDevice(data.dni)
-    if (ch == null) {
-        log.error("retryExecuteCommand: child ${data.dni} not found")
-        return
-    }
-    executeCommand(ch, data.service, data.data, data.attempt ?: 0)
+def executeCommand(ch, service, data = [:]) {
+    entity = ch?.getDeviceNetworkId().split("-")[1]
+    domain = entity?.tokenize(".")[0]
+    messUpd = [id: atomicState.id, type: "call_service", domain: domain, service: service, service_data : [entity_id: entity] + data]
+    atomicState.id = atomicState.id + 1
+    messUpdStr = JsonOutput.toJson(messUpd)
+    if (logEnable) log.debug("messUpdStr = ${messUpdStr}")
+    log.info("executeCommand: ${entity}, ${messUpdStr}")
+    interfaces.webSocket.sendMessage(messUpdStr)
 }
 
 def deleteAllChildDevices() {
